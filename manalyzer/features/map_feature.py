@@ -9,6 +9,6 @@ def run(supabase):
     # logger.info("Running feature: map_feature")
 
     # TODO:
-    # TBD
+    # This feature needs geo/location data, which is not available in the current schema.
 
     return

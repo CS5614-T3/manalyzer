@@ -63,7 +63,7 @@ comment on column analysis_result.created_at is 'executed time of analysis';
 -- =========================================================
 -- 3. res_timeseries
 --    for timeseries analysis, store x->y values to this table
---    it can provide time values by scale type d(ay)/m(onth)/y(ear) per 1 result_id : x_scale_type
+--    it can provide time values by scale type d(ay)/w(eek)/m(onth)/y(ear) per 1 result_id : x_scale_type
 -- =========================================================
 create table if not exists res_timeseries (
     result_id bigint not null,
@@ -81,7 +81,7 @@ create table if not exists res_timeseries (
         on delete cascade,
 
     constraint chk_res_timeseries_x_scale_type
-        check (x_scale_type in ('d', 'm', 'y')),
+        check (x_scale_type in ('d', 'w', 'm', 'y')),
 
     constraint chk_res_timeseries_x_order
         check (x_order >= 0)
@@ -89,7 +89,7 @@ create table if not exists res_timeseries (
 
 comment on table res_timeseries is 'timeseries values for analysis result';
 comment on column res_timeseries.result_id is 'analysis result_id';
-comment on column res_timeseries.x_scale_type is 'scale unit: d(ay)/m(onth)/y(ear)';
+comment on column res_timeseries.x_scale_type is 'scale unit: d(ay)/w(eek)/m(onth)/y(ear)';
 comment on column res_timeseries.x_order is 'order of x-axis values';
 comment on column res_timeseries.x_value is 'real value of x-axis (time)';
 comment on column res_timeseries.y_value is 'real y value';
@@ -102,13 +102,13 @@ create table if not exists res_rank (
     result_id bigint not null,
     rank_value integer not null,
     label varchar(255) not null,
-    instance_id bigint null,
+    instance_id text null,
     amount numeric(20,4) not null,
     metric_type varchar(50) not null,
     extra_json jsonb,
 
     constraint pk_res_rank
-        primary key (result_id, rank_value, label),
+        primary key (result_id, metric_type, rank_value, label),
 
     constraint fk_res_rank_result_id
         foreign key (result_id)
@@ -138,7 +138,7 @@ comment on column res_rank.extra_json is 'extra info (json)';
 -- =========================================================
 create table if not exists res_instance (
     result_id bigint not null,
-    instance_id bigint not null,
+    instance_id text not null,
     user_count bigint,
     activity numeric(20,6),
     trend_activity numeric(20,6),
@@ -186,7 +186,7 @@ create table if not exists current_analysis_result (
     task_type smallint not null,
     target_type varchar(20) not null,
     result_id bigint not null,
-    target_id bigint null,
+    target_id text null,
     created_at timestamptz not null default now(),
 
     constraint fk_current_analysis_result_task_type
