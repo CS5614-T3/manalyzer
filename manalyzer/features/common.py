@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 from collections.abc import Iterable
 from datetime import date, datetime, timezone
 
@@ -94,7 +95,7 @@ def parse_datetime(value):
     if isinstance(value, datetime):
         if value.tzinfo is None:
             return value.replace(tzinfo=timezone.utc)
-        return value
+        return value.astimezone(timezone.utc)
     if isinstance(value, date):
         return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
     if isinstance(value, str):
@@ -105,8 +106,36 @@ def parse_datetime(value):
             return None
         if parsed.tzinfo is None:
             return parsed.replace(tzinfo=timezone.utc)
-        return parsed
+        return parsed.astimezone(timezone.utc)
     return None
+
+
+def day_start(value):
+    # value: date-like object
+    # Return UTC midnight for daily x-axis values.
+    return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+
+
+def latest_daily_metric(snapshots, metric_name):
+    # Keep only the newest snapshot per instance per UTC day before aggregating.
+    latest = {}
+
+    for row in snapshots:
+        instance_id = row.get("id")
+        created_at = parse_datetime(row.get("created_at"))
+        if not instance_id or created_at is None:
+            continue
+
+        day = day_start(created_at.date())
+        key = (instance_id, day)
+        current = latest.get(key)
+        if current is None or created_at > current[0]:
+            latest[key] = (created_at, num(row.get(metric_name)))
+
+    daily_by_instance = defaultdict(dict)
+    for (instance_id, day), (_created_at, value) in latest.items():
+        daily_by_instance[instance_id][day] = value
+    return daily_by_instance
 
 
 def parse_date(value):
@@ -219,6 +248,33 @@ def create_analysis_result(
     return result_id
 
 
+def create_analysis_results(supabase, feature_name, result_specs):
+    # Insert many analysis_result rows with one task metadata upsert.
+    # result_specs: dicts with time_from/time_to/target_type/target_id.
+    if not result_specs:
+        return []
+
+    task_type = ensure_task_type(supabase, feature_name)
+    result_ids = []
+    rows = []
+    for spec in result_specs:
+        result_id = new_result_id()
+        result_ids.append(result_id)
+        rows.append(
+            {
+                "result_id": result_id,
+                "task_type": task_type,
+                "target_type": spec.get("target_type", "global"),
+                "target_id": spec.get("target_id"),
+                "time_from": iso(spec.get("time_from")),
+                "time_to": iso(spec.get("time_to")),
+            }
+        )
+
+    insert_rows(supabase, "analysis_result", rows)
+    return result_ids
+
+
 def replace_current_result(
     supabase,
     feature_name,
@@ -243,6 +299,28 @@ def replace_current_result(
             "result_id": result_id,
         }
     ).execute()
+
+
+def replace_current_results(supabase, feature_name, current_rows):
+    # Replace all frontend pointers for one feature in bulk.
+    if not current_rows:
+        return
+
+    task_type = task_meta(feature_name)["task_type"]
+    supabase.table("current_analysis_result").delete().eq("task_type", task_type).execute()
+    insert_rows(
+        supabase,
+        "current_analysis_result",
+        [
+            {
+                "task_type": task_type,
+                "target_type": row.get("target_type", "global"),
+                "target_id": row.get("target_id"),
+                "result_id": row["result_id"],
+            }
+            for row in current_rows
+        ],
+    )
 
 
 def insert_rows(supabase, table, rows):

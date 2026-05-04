@@ -4,11 +4,11 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 from manalyzer.features.common import (
-    create_analysis_result,
+    create_analysis_results,
     fetch_all,
     insert_rows,
     parse_datetime,
-    replace_current_result,
+    replace_current_results,
 )
 
 # from manalyzer.logger import get_logger
@@ -71,22 +71,32 @@ def build_joined_rows(trends, history, instances):
     return joined_rows
 
 
-def build_rank_rows(joined_rows, instance_id, metric_name, period_start, period_end, result_id):
-    # stats_by_label accumulates one metric inside the selected date window.
-    # If instance_id is None, aggregate all servers into one global ranking.
-    stats_by_label = defaultdict(lambda: {"amount": 0.0, "trend_ids": set(), "base_urls": set()})
+def add_rank_stat(stats, key, row, metric_name):
+    label = row["label"]
+    entry = stats[key][label]
+    entry["amount"] += row[metric_name]
+    entry["trend_ids"].add(row["trend_id"])
+    entry["base_urls"].add(row["base_url"])
+
+
+def build_rank_stats(joined_rows, analysis_day):
+    # Pre-aggregate once for all global and per-instance rankings.
+    stats = defaultdict(lambda: defaultdict(lambda: {"amount": 0.0, "trend_ids": set(), "base_urls": set()}))
+    period_end = analysis_day + timedelta(days=1)
 
     for row in joined_rows:
-        if instance_id is not None and row["instance_id"] != instance_id:
-            continue
-        if not (period_start <= row["day"] < period_end):
-            continue
+        for _task_name, metric_name, period_days in RANK_SPECS:
+            period_start = period_end - timedelta(days=period_days)
+            if not (period_start <= row["day"] < period_end):
+                continue
+            spec_key = (metric_name, period_days)
+            add_rank_stat(stats, (None, *spec_key), row, metric_name)
+            add_rank_stat(stats, (row["instance_id"], *spec_key), row, metric_name)
 
-        stats = stats_by_label[row["label"]]
-        stats["amount"] += row[metric_name]
-        stats["trend_ids"].add(row["trend_id"])
-        stats["base_urls"].add(row["base_url"])
+    return stats
 
+
+def build_rank_rows(stats_by_label, instance_id, metric_name, period_days, result_id):
     # ranked keeps only the top hashtags for this instance/metric/window.
     ranked = sorted(stats_by_label.items(), key=lambda item: item[1]["amount"], reverse=True)[:TOP_N]
     return [
@@ -98,7 +108,7 @@ def build_rank_rows(joined_rows, instance_id, metric_name, period_start, period_
             "amount": stats["amount"],
             "metric_type": metric_name,
             "extra_json": {
-                "period_days": (period_end - period_start).days,
+                "period_days": period_days,
                 "trend_ids": sorted(value for value in stats["trend_ids"] if value),
                 "base_urls": sorted(value for value in stats["base_urls"] if value),
             },
@@ -107,31 +117,45 @@ def build_rank_rows(joined_rows, instance_id, metric_name, period_start, period_
     ]
 
 
-def write_rank_result(supabase, task_name, joined_rows, instance_id, metric_name, analysis_day, period_days):
+def write_rank_results(supabase, task_name, stats, instance_ids, metric_name, analysis_day, period_days):
     # period_end is exclusive, so a 1-day window covers exactly analysis_day.
     period_end = analysis_day + timedelta(days=1)
     period_start = period_end - timedelta(days=period_days)
-    target_type = "global" if instance_id is None else "instance"
+    targets = [None, *instance_ids]
+    result_specs = [
+        {
+            "time_from": period_start,
+            "time_to": period_end - timedelta(seconds=1),
+            "target_type": "global" if instance_id is None else "instance",
+            "target_id": instance_id,
+        }
+        for instance_id in targets
+    ]
+    result_ids = create_analysis_results(supabase, task_name, result_specs)
 
-    result_id = create_analysis_result(
-        supabase,
-        task_name,
-        time_from=period_start,
-        time_to=period_end - timedelta(seconds=1),
-        target_type=target_type,
-        target_id=instance_id,
-    )
+    rank_rows = []
+    current_rows = []
+    for result_id, instance_id in zip(result_ids, targets):
+        target_type = "global" if instance_id is None else "instance"
+        rank_rows.extend(
+            build_rank_rows(
+                stats.get((instance_id, metric_name, period_days), {}),
+                instance_id,
+                metric_name,
+                period_days,
+                result_id,
+            )
+        )
+        current_rows.append(
+            {
+                "result_id": result_id,
+                "target_type": target_type,
+                "target_id": instance_id,
+            }
+        )
 
-    rank_rows = build_rank_rows(
-        joined_rows,
-        instance_id,
-        metric_name,
-        period_start,
-        period_end,
-        result_id,
-    )
     insert_rows(supabase, "res_rank", rank_rows)
-    replace_current_result(supabase, task_name, result_id, target_type=target_type, target_id=instance_id)
+    replace_current_results(supabase, task_name, current_rows)
 
 
 def run(supabase):
@@ -148,30 +172,17 @@ def run(supabase):
 
     # analysis_day is the most recent trend day available in the collected data.
     analysis_day = max(row["day"] for row in joined_rows)
+    rank_stats = build_rank_stats(joined_rows, analysis_day)
+    instance_ids = sorted({row["instance_id"] for row in joined_rows})
 
-    # Create global rankings first by aggregating all instances together.
+    # Write global and per-instance rankings for each metric/window in bulk.
     for task_name, metric_name, period_days in RANK_SPECS:
-        write_rank_result(
+        write_rank_results(
             supabase,
             task_name,
-            joined_rows,
-            None,
+            rank_stats,
+            instance_ids,
             metric_name,
             analysis_day,
             period_days,
         )
-
-    # Then create per-instance rankings for servers that have joined trend events.
-    instance_ids = sorted({row["instance_id"] for row in joined_rows})
-
-    for instance_id in instance_ids:
-        for task_name, metric_name, period_days in RANK_SPECS:
-            write_rank_result(
-                supabase,
-                task_name,
-                joined_rows,
-                instance_id,
-                metric_name,
-                analysis_day,
-                period_days,
-            )

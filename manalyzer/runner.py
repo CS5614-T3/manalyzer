@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 
 from manalyzer.db_client import get_db_client
 # from manalyzer.logger import get_logger
@@ -24,25 +25,30 @@ FEATURES = {
 }
 
 
-def run_feature(feature_name: str):
+def run_feature(feature_name: str, supabase_client=None):
 
     if feature_name not in list(FEATURES.keys()):
         available = ", ".join(list(FEATURES.keys()))
         raise ValueError(f"Unknown feature: {feature_name}. Available: {available}")
 
-    supabase_client = get_db_client()
+    if supabase_client is None:
+        supabase_client = get_db_client()
     runner = FEATURES[feature_name]
     
+    started_at = time.perf_counter()
     try:
         runner(supabase_client)
-        print(f"{feature_name} done")
+        elapsed = time.perf_counter() - started_at
+        print(f"{feature_name} done ({elapsed:.2f}s)")
     except Exception as e:
-        print(f"{feature_name} failed: {e}")
+        elapsed = time.perf_counter() - started_at
+        print(f"{feature_name} failed after {elapsed:.2f}s: {e}")
 
 
 def run_all_features():
+    supabase_client = get_db_client()
     for feature_name in list(FEATURES.keys()):
-        run_feature(feature_name)
+        run_feature(feature_name, supabase_client=supabase_client)
         
 
 

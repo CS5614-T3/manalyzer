@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 from manalyzer.features.common import (
-    create_analysis_result,
+    create_analysis_results,
     fetch_all,
     insert_rows,
-    parse_datetime,
-    replace_current_result,
+    latest_daily_metric,
+    replace_current_results,
 )
 
 # from manalyzer.logger import get_logger
@@ -21,12 +21,6 @@ WEEKLY_WEEKS = 5
 MONTHLY_4WEEK_BUCKETS = 3
 
 
-def day_start(value):
-    # value: date-like object from created_at.date()
-    # Return the UTC midnight timestamp used as the daily x-axis value.
-    return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
-
-
 def window_start(analysis_day, days_back):
     # analysis_day: latest available snapshot day
     # days_back: number of days to move backward from analysis_day
@@ -35,28 +29,8 @@ def window_start(analysis_day, days_back):
 
 def latest_daily_users(snapshots):
     # snapshots: rows from instances_snapshot_raw
-    # latest: maps (instance_id, day) to the newest snapshot timestamp and users value.
-    latest = {}
-
-    for row in snapshots:
-        instance_id = row.get("id")
-        created_at = parse_datetime(row.get("created_at"))
-        if not instance_id or created_at is None:
-            continue
-
-        day = day_start(created_at.date())
-        key = (instance_id, day)
-        current = latest.get(key)
-
-        # If there are multiple snapshots on the same day, keep only the newest one.
-        if current is None or created_at > current[0]:
-            latest[key] = (created_at, float(row.get("users") or 0))
-
-    # daily_by_instance: {instance_id: {day: users}}
-    daily_by_instance = defaultdict(dict)
-    for (instance_id, day), (_created_at, users) in latest.items():
-        daily_by_instance[instance_id][day] = users
-    return daily_by_instance
+    # If there are multiple snapshots on the same day, keep only the newest one.
+    return latest_daily_metric(snapshots, "users")
 
 
 def sum_by_fixed_windows(daily_values, analysis_day, window_days, bucket_count):
@@ -107,24 +81,63 @@ def build_timeseries_rows(result_id, period_values):
     return rows
 
 
-def write_user_result(supabase, target_type, target_id, daily_values, analysis_day):
-    # target_type/target_id identify either one instance or the global result.
-    if not daily_values:
-        return
+def build_user_result(result_id, target_type, target_id, period_values, analysis_day):
+    return {
+        "current": {
+            "result_id": result_id,
+            "target_type": target_type,
+            "target_id": target_id,
+        },
+        "result_spec": {
+            "time_from": min(min(values) for values in period_values.values() if values),
+            "time_to": analysis_day,
+            "target_type": target_type,
+            "target_id": target_id,
+        },
+        "timeseries_rows": build_timeseries_rows(result_id, period_values),
+    }
 
-    period_values = build_period_values(daily_values, analysis_day)
-    result_id = create_analysis_result(
-        supabase,
-        "user_growth",
-        time_from=min(min(values) for values in period_values.values() if values),
-        time_to=analysis_day,
-        target_type=target_type,
-        target_id=target_id,
-    )
 
-    timeseries_rows = build_timeseries_rows(result_id, period_values)
+def write_user_results(supabase, result_inputs, analysis_day):
+    result_inputs = [item for item in result_inputs if item["daily_values"]]
+    prepared_results = []
+    for item in result_inputs:
+        period_values = build_period_values(item["daily_values"], analysis_day)
+        prepared_results.append(
+            {
+                "target_type": item["target_type"],
+                "target_id": item["target_id"],
+                "period_values": period_values,
+                "result_spec": {
+                    "time_from": min(min(values) for values in period_values.values() if values),
+                    "time_to": analysis_day,
+                    "target_type": item["target_type"],
+                    "target_id": item["target_id"],
+                },
+            }
+        )
+
+    result_specs = [
+        item["result_spec"]
+        for item in prepared_results
+    ]
+    result_ids = create_analysis_results(supabase, "user_growth", result_specs)
+
+    timeseries_rows = []
+    current_rows = []
+    for result_id, item in zip(result_ids, prepared_results):
+        built = build_user_result(
+            result_id,
+            item["target_type"],
+            item["target_id"],
+            item["period_values"],
+            analysis_day,
+        )
+        timeseries_rows.extend(built["timeseries_rows"])
+        current_rows.append(built["current"])
+
     insert_rows(supabase, "res_timeseries", timeseries_rows)
-    replace_current_result(supabase, "user_growth", result_id, target_type=target_type, target_id=target_id)
+    replace_current_results(supabase, "user_growth", current_rows)
 
 
 def run(supabase):
@@ -147,9 +160,23 @@ def run(supabase):
 
     # global_daily_values: sum of instance-level daily user values by date.
     global_daily_values = defaultdict(float)
+    result_inputs = []
     for instance_id, daily_values in daily_by_instance.items():
-        write_user_result(supabase, "instance", instance_id, daily_values, analysis_day)
+        result_inputs.append(
+            {
+                "target_type": "instance",
+                "target_id": instance_id,
+                "daily_values": daily_values,
+            }
+        )
         for day, value in daily_values.items():
             global_daily_values[day] += value
 
-    write_user_result(supabase, "global", None, dict(global_daily_values), analysis_day)
+    result_inputs.append(
+        {
+            "target_type": "global",
+            "target_id": None,
+            "daily_values": dict(global_daily_values),
+        }
+    )
+    write_user_results(supabase, result_inputs, analysis_day)

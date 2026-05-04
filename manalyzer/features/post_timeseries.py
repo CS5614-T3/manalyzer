@@ -4,22 +4,17 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 from manalyzer.features.common import (
-    create_analysis_result,
+    create_analysis_results,
+    day_start,
     fetch_all,
     insert_rows,
-    parse_datetime,
-    replace_current_result,
+    latest_daily_metric,
+    replace_current_results,
 )
 
 # from manalyzer.logger import get_logger
 
 # logger = get_logger(__name__)
-
-
-def day_start(value):
-    # value: date-like object from created_at.date()
-    # Return UTC midnight for daily x-axis values.
-    return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
 
 
 def week_start(value):
@@ -37,28 +32,8 @@ def month_start(value):
 
 def latest_daily_statuses(snapshots):
     # snapshots: rows from instances_snapshot_raw
-    # latest: maps (instance_id, day) to the newest snapshot timestamp and statuses value.
-    latest = {}
-
-    for row in snapshots:
-        instance_id = row.get("id")
-        created_at = parse_datetime(row.get("created_at"))
-        if not instance_id or created_at is None:
-            continue
-
-        day = day_start(created_at.date())
-        key = (instance_id, day)
-        current = latest.get(key)
-
-        # If an instance has multiple snapshots on one day, keep the newest one.
-        if current is None or created_at > current[0]:
-            latest[key] = (created_at, float(row.get("statuses") or 0))
-
-    # daily_by_instance: {instance_id: {day: statuses}}
-    daily_by_instance = defaultdict(dict)
-    for (instance_id, day), (_created_at, statuses) in latest.items():
-        daily_by_instance[instance_id][day] = statuses
-    return daily_by_instance
+    # If an instance has multiple snapshots on one day, keep the newest one.
+    return latest_daily_metric(snapshots, "statuses")
 
 
 def aggregate_periods(daily_values):
@@ -96,25 +71,52 @@ def build_timeseries_rows(result_id, period_values):
     return rows
 
 
-def write_timeseries_result(supabase, target_type, target_id, daily_values):
-    # target_type/target_id identify either one instance or the global result.
-    if not daily_values:
-        return
-
+def build_timeseries_result(result_id, target_type, target_id, daily_values):
     days = sorted(daily_values)
-    result_id = create_analysis_result(
-        supabase,
-        "post_timeseries",
-        time_from=days[0],
-        time_to=days[-1],
-        target_type=target_type,
-        target_id=target_id,
-    )
-
     period_values = aggregate_periods(daily_values)
-    timeseries_rows = build_timeseries_rows(result_id, period_values)
+    return {
+        "current": {
+            "result_id": result_id,
+            "target_type": target_type,
+            "target_id": target_id,
+        },
+        "result_spec": {
+            "time_from": days[0],
+            "time_to": days[-1],
+            "target_type": target_type,
+            "target_id": target_id,
+        },
+        "timeseries_rows": build_timeseries_rows(result_id, period_values),
+    }
+
+
+def write_timeseries_results(supabase, result_inputs):
+    result_inputs = [item for item in result_inputs if item["daily_values"]]
+    result_specs = [
+        {
+            "time_from": min(item["daily_values"]),
+            "time_to": max(item["daily_values"]),
+            "target_type": item["target_type"],
+            "target_id": item["target_id"],
+        }
+        for item in result_inputs
+    ]
+    result_ids = create_analysis_results(supabase, "post_timeseries", result_specs)
+
+    timeseries_rows = []
+    current_rows = []
+    for result_id, item in zip(result_ids, result_inputs):
+        built = build_timeseries_result(
+            result_id,
+            item["target_type"],
+            item["target_id"],
+            item["daily_values"],
+        )
+        timeseries_rows.extend(built["timeseries_rows"])
+        current_rows.append(built["current"])
+
     insert_rows(supabase, "res_timeseries", timeseries_rows)
-    replace_current_result(supabase, "post_timeseries", result_id, target_type=target_type, target_id=target_id)
+    replace_current_results(supabase, "post_timeseries", current_rows)
 
 
 def run(supabase):
@@ -129,9 +131,23 @@ def run(supabase):
 
     # global_daily_values: sum of instance-level daily statuses by date.
     global_daily_values = defaultdict(float)
+    result_inputs = []
     for instance_id, daily_values in daily_by_instance.items():
-        write_timeseries_result(supabase, "instance", instance_id, daily_values)
+        result_inputs.append(
+            {
+                "target_type": "instance",
+                "target_id": instance_id,
+                "daily_values": daily_values,
+            }
+        )
         for day, value in daily_values.items():
             global_daily_values[day] += value
 
-    write_timeseries_result(supabase, "global", None, dict(global_daily_values))
+    result_inputs.append(
+        {
+            "target_type": "global",
+            "target_id": None,
+            "daily_values": dict(global_daily_values),
+        }
+    )
+    write_timeseries_results(supabase, result_inputs)
