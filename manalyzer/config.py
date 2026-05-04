@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.join(BASE_DIR, "..")
+ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
 PRIVATE_DIR = os.path.join(ROOT_DIR, "private")
 DB_CONFIG_PATH = os.path.join(PRIVATE_DIR, "db_env.json")
 
