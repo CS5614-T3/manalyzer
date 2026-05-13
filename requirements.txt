@@ -1,2 +1,4 @@
 supabase
 python-dateutil
+openai
+sentence-transformers
